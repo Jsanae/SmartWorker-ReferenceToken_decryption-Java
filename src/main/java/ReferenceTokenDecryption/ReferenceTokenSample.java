@@ -5,20 +5,32 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
-import java.net.URL;
 import java.util.Base64;
+
 import com.nimbusds.jose.*;
-import com.nimbusds.jose.crypto.RSADecrypter;
-import com.nimbusds.jose.crypto.RSASSAVerifier;
 import com.nimbusds.jose.jwk.JWK;
-import com.nimbusds.jose.jwk.RSAKey;
-import com.nimbusds.jwt.EncryptedJWT;
-import com.nimbusds.jwt.SignedJWT;
+import com.nimbusds.jose.jwk.JWKSet;
+import com.nimbusds.jose.jwk.source.ImmutableJWKSet;
+import com.nimbusds.jose.jwk.source.JWKSource;
+import com.nimbusds.jose.jwk.source.RemoteJWKSet;
+import com.nimbusds.jose.proc.BadJOSEException;
+import com.nimbusds.jose.proc.JWEDecryptionKeySelector;
+import com.nimbusds.jose.proc.JWEKeySelector;
+import com.nimbusds.jose.proc.JWSKeySelector;
+import com.nimbusds.jose.proc.JWSVerificationKeySelector;
+import com.nimbusds.jose.proc.SecurityContext;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.proc.ConfigurableJWTProcessor;
+import com.nimbusds.jwt.proc.DefaultJWTProcessor;
 import com.nimbusds.oauth2.sdk.ParseException;
-import net.minidev.json.JSONObject;
+import com.nimbusds.oauth2.sdk.http.HTTPRequest;
+import com.nimbusds.oauth2.sdk.http.HTTPResponse;
+import com.nimbusds.oauth2.sdk.id.Issuer;
+import com.nimbusds.openid.connect.sdk.op.OIDCProviderConfigurationRequest;
+import com.nimbusds.openid.connect.sdk.op.OIDCProviderMetadata;
+
 
 public class ReferenceTokenSample {
-
 
   /**
    *
@@ -28,11 +40,27 @@ public class ReferenceTokenSample {
    * @throws MalformedURLException
    * @throws IOException
    * @throws ParseException
+   * @throws java.text.ParseException
+   * @throws JOSEException
+   * @throws BadJOSEException
    */
-  private static String getUserInfo(String idpUrl, String referenceToken) throws MalformedURLException, IOException, ParseException {
+  public static String getUserInfo(String idpUrl, String referenceToken, String b64EncodedCert) throws MalformedURLException, IOException, ParseException, java.text.ParseException, BadJOSEException, JOSEException {
 
-    URL issuerURI = new URL(idpUrl);
-    HttpURLConnection conn = (HttpURLConnection) issuerURI.openConnection();
+    Issuer iss = new Issuer(idpUrl);
+
+    // Will resolve the OpenID provider metadata automatically
+    OIDCProviderConfigurationRequest request = new OIDCProviderConfigurationRequest(iss);
+
+    // Make HTTP request
+    HTTPRequest httpRequest = request.toHTTPRequest();
+    HTTPResponse httpResponse = httpRequest.send();
+
+    // Parse OpenID provider metadata
+    OIDCProviderMetadata opMetadata = OIDCProviderMetadata.parse(httpResponse.getContentAsJSONObject());
+
+
+    // Exchange referencetoken for a JWT
+    HttpURLConnection conn = (HttpURLConnection) opMetadata.getUserInfoEndpointURI().toURL().openConnection();
     conn.setRequestMethod("GET");
     conn.setRequestProperty("Authorization", referenceToken);
 
@@ -44,82 +72,64 @@ public class ReferenceTokenSample {
       result.append(line);
     }
     rd.close();
-    System.out.println(result.toString());
-    return result.toString();
+
+    String encryptedJWT = result.toString();
+
+    // Set up a JWT processor to parse the tokens and then check their signature
+    // and validity time window (bounded by the "iat", "nbf" and "exp" claims)
+    ConfigurableJWTProcessor<SecurityContext> jwtProcessor = new DefaultJWTProcessor();
+
+    // The public RSA keys to validate the signatures will be sourced from the
+    // OAuth 2.0 server's JWK set, published at a well-known URL. The RemoteJWKSet
+    // object caches the retrieved keys to speed up subsequent look-ups and can
+    // also gracefully handle key-rollover
+    JWKSource keySource = new RemoteJWKSet(opMetadata.getJWKSetURI().toURL());
+
+    // The expected JWS algorithm of the access tokens (agreed out-of-band)
+    JWSAlgorithm expectedJWSAlg = JWSAlgorithm.RS256;
+
+    // Configure the JWT processor with a key selector to feed matching public
+    // RSA keys sourced from the JWK set URL
+    JWSKeySelector keySelector = new JWSVerificationKeySelector(expectedJWSAlg, keySource);
+    jwtProcessor.setJWSKeySelector(keySelector);
+
+    // The expected JWE algorithm and method
+    JWEAlgorithm expectedJWEAlg = JWEAlgorithm.RSA1_5;
+    EncryptionMethod expectedJWEEnc = EncryptionMethod.A128CBC_HS256;
+
+    // The JWE key source
+    String decodedKey = new String(Base64.getDecoder().decode(b64EncodedCert));
+    JWK secretKey = JWK.parse(decodedKey);
+
+    JWKSet set = new JWKSet(secretKey);
+    JWKSource jweKeySource = new ImmutableJWKSet(set);
+
+    // Configure a key selector to handle the decryption phase
+    JWEKeySelector jweKeySelector = new JWEDecryptionKeySelector(expectedJWEAlg, expectedJWEEnc, jweKeySource);
+    jwtProcessor.setJWEKeySelector(jweKeySelector);
+
+    // Process the token
+    SecurityContext ctx = null; // optional context parameter, not required here
+    JWTClaimsSet claimsSet = jwtProcessor.process(encryptedJWT, ctx);
+
+    // Print out the token claims set
+    return claimsSet.toString();
   }
 
 
-  /**
-   *
-   * @param jwtFromUserInfoEndpoint Base64 encoded string received to be decrypted
-   * @param privateKey Base64 encoded String of partner certificate
-   * @return JSONObject of decrypted payload
-   * @throws Exception
-   */
-  private static JSONObject decryptJWT(String jwtFromUserInfoEndpoint, String privateKey) throws Exception {
-
-    // Decode the partner certificate and create a RSAKey of the JWK
-    String decodedKey = new String(Base64.getDecoder().decode(privateKey));
-    RSAKey rsaKey = (RSAKey) JWK.parse(decodedKey);
-
-    // Create a JWT object from the JWT string received from Smart Ansatt
-    EncryptedJWT jwt = EncryptedJWT.parse(jwtFromUserInfoEndpoint);
-
-    // Create a RSADecrypter using the RSAKey to be used when decrypting the JWT
-    RSADecrypter decrypter = new RSADecrypter(rsaKey);
-
-    // Decrypt the JWT
-    jwt.decrypt(decrypter);
-
-    // Create a signed JWT object to fetch the payload
-    SignedJWT signedJWT = jwt.getPayload().toSignedJWT();
-
-
-    JSONObject payload = signedJWT.getPayload().toJSONObject();
-
-    // We could now return the payload. but if you wish to verify the signature as well, continue reading.
-    // First load the Signature certificate used for validation of sender
-    // This can be retrieved from the following endpoints:
-    // Production: https://idp.smartansatt.telenor.no/.well-known/openid-configuration, where jwks certificates
-    // are defined as "jwks_uri":"https://idp.smartansatt.pimdemo.no/idp/certs"
-    // Development: https://smartworker-dev-azure-idp.smartansatt.telenor.no/.well-known/openid-configuration, where jwks certificates
-    // are defined as "jwks_uri":"https://smartworker-dev-azure-idp.pimdemo.no/idp/certs"
-    // Find the correct one by matching "kid" in the cert-list from the one in the JWT/JWS/JWE header received from userinfo endpoint
-
-    // 'signatureKey' is the base64 encoded string of the signature JWK (this is the public certificate currently being used. You should check this is the correct one following the steps above)
-    // The decoded signature is then used to create a new RSAKey which we will use to create a JWSVerifier
-    String signatureKey = "ICAgICAgIHsNCiAgICAgICAgICAgICJrdHkiOiAiUlNBIiwNCiAgICAgICAgICAgICJraWQiOiAic2lnLXJzLTAiLA0KICAgICAgICAgICAgInVzZSI6ICJzaWciLA0KICAgICAgICAgICAgImUiOiAiQVFBQiIsDQogICAgICAgICAgICAibiI6ICJoVEViLW9wSk0wQkNCRjBpakFtM1JhVVVCVjNsRFo3ZlFORTZ4dUViQVFqNElwNDN5b1RPOVVjbUhvRGdFMzNGT0I4V01WbHFsNVpIaUExTnppVGUxZC1NRHpTMllRb3ZjOHlxUW80TUtjUkFTQUhMN2lOajdwVllwUDZZWEd4V0V3VTFPWXVRQnBaTkdvTm9VNUp1Rk5oQlRIZi1kMHZRZjNXVGZuaEdjZlg2WnlERWdYVmk5N2tfSlVWZHR2YTJaMU9Tem15aDI2MXRaZlFnMG1TSWxDM1EtTWRJLXBQTVh5cHNFaV9jVDFMWHVtbk4wVUdyQUZSeHYzeHBHY3ZOckNqRF95aXcwQ3BlWGQwZzJOR3BlUE5BY1JlVlREdEg5elEyREZxWDNKdDRLN0ZDaEh3VzN6QjdEdjVJdVlKOVJLdm9nSW1aU2R0Q2x4N3UtcDlQdlEiDQogICAgICAgIH0=";
-    String decodedSig = new String(Base64.getDecoder().decode(signatureKey));
-    RSAKey rsaSigKey = (RSAKey) JWK.parse(decodedSig);
-    JWSVerifier jwsVerifier = new RSASSAVerifier(rsaSigKey);
-
-    // Now we can verify the signature. Returns true if the signature was successfully verified, false if not.
-    boolean isValid = signedJWT.verify(jwsVerifier);
-
-    // Implement your own error handling
-    if(!isValid) {
-      throw new Exception("Signature did not successfully verify");
-    }
-
-    return payload;
-  }
   public static void main(String[] args){
 
     // A client will connect to your endpoint with following header -> Authorization: Bearer <referencetoken>
-    // This referencetoken is then used to do HTTP GET towards Smart Ansatt IDP url (without the Bearer prefix).
-    // Production endpoint: https://idp.smartansatt.telenor.no/idp/me     Development endpoint: https://smartworker-dev-azure-idp.pimdemo.no/idp/me
-    //
-    // From the 'getUserInfo' method you will receive a Base64 encoded string of the JWT which you will need to decrypt and verify the signature
-    // receivedJWTfromUserInfoEndpoint = "someRandomBase64Encodedstring.someRandomBase64Encodedstring.someRandomBase64Encodedstring.someRandomBase64Encodedstring.someRandomBase64Encodedstring"
+    // This referencetoken is then used to do HTTP GET towards Smart Ansatt IDP url (without the Bearer prefix), where you will recieve an encrypted
+    // jwt containing userinfo.
+    // Production endpoint: https://idp.smartansatt.telenor.no    Development endpoint: https://smartworker-dev-azure-idp.pimdemo.no
 
     try {
-      String receivedJWTfromUserInfoEndpoint = ReferenceTokenSample.getUserInfo("https://smartworker-dev-azure-idp.pimdemo.no/idp/me", "<referencetoken>");
 
-      // Load the partner certificate with private key to decrypt the content
-      String b64EncodedCert = "someRandomBase64EncodedString";
-
-      // 'decryptJWT' decrypts and verifies the signature of the JWT received
-      JSONObject payload = ReferenceTokenSample.decryptJWT(receivedJWTfromUserInfoEndpoint, b64EncodedCert);
+      final String idpUrl = "https://idp.smartansatt.telenor.no";
+      final String b64EncodedCert = "";
+      final String referenceToken = "";
+      String payload = ReferenceTokenSample.getUserInfo(idpUrl, referenceToken, b64EncodedCert);
 
       System.out.println(payload.toString());
       /* The payload will typically look something like this
