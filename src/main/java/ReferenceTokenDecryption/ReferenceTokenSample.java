@@ -11,8 +11,8 @@ import com.nimbusds.jose.*;
 import com.nimbusds.jose.jwk.JWK;
 import com.nimbusds.jose.jwk.JWKSet;
 import com.nimbusds.jose.jwk.source.ImmutableJWKSet;
+import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import com.nimbusds.jose.jwk.source.JWKSource;
-import com.nimbusds.jose.jwk.source.RemoteJWKSet;
 import com.nimbusds.jose.proc.BadJOSEException;
 import com.nimbusds.jose.proc.JWEDecryptionKeySelector;
 import com.nimbusds.jose.proc.JWEKeySelector;
@@ -36,6 +36,8 @@ public class ReferenceTokenSample {
    *
    * @param idpUrl URL to Smart Ansatt IDP endpoint
    * @param referenceToken token received in header when clients connect to your endpoint
+   * @param b64EncodedCert Base64 encoded JWK
+   * @param secret Client secret
    * @return JWT String
    * @throws MalformedURLException
    * @throws IOException
@@ -44,7 +46,7 @@ public class ReferenceTokenSample {
    * @throws JOSEException
    * @throws BadJOSEException
    */
-  public static String getUserInfo(String idpUrl, String referenceToken, String b64EncodedCert) throws MalformedURLException, IOException, ParseException, java.text.ParseException, BadJOSEException, JOSEException {
+  public static String getUserInfo(String idpUrl, String referenceToken, String b64EncodedCert, String secretKey) throws MalformedURLException, IOException, ParseException, java.text.ParseException, BadJOSEException, JOSEException {
 
     Issuer iss = new Issuer(idpUrl);
 
@@ -72,26 +74,29 @@ public class ReferenceTokenSample {
       result.append(line);
     }
     rd.close();
-
     String encryptedJWT = result.toString();
 
     // Set up a JWT processor to parse the tokens and then check their signature
     // and validity time window (bounded by the "iat", "nbf" and "exp" claims)
     ConfigurableJWTProcessor<SecurityContext> jwtProcessor = new DefaultJWTProcessor();
 
-    // The public RSA keys to validate the signatures will be sourced from the
+    // The public RSA keys to validate the signatures can be sourced from the
     // OAuth 2.0 server's JWK set, published at a well-known URL. The RemoteJWKSet
     // object caches the retrieved keys to speed up subsequent look-ups and can
     // also gracefully handle key-rollover
-    JWKSource keySource = new RemoteJWKSet(opMetadata.getJWKSetURI().toURL());
+    //JWKSource keySource = new RemoteJWKSet(opMetadata.getJWKSetURI().toURL());
+    //In this example we will be using the shared secret key and no remote fetching of keys is necessary
+    ImmutableSecret secret = new ImmutableSecret(secretKey.getBytes());
 
     // The expected JWS algorithm of the access tokens (agreed out-of-band)
-    JWSAlgorithm expectedJWSAlg = JWSAlgorithm.RS256;
+    //JWSAlgorithm expectedJWSAlg = JWSAlgorithm.RS256;
+    JWSAlgorithm expectedJWSAlg = JWSAlgorithm.HS256;
 
     // Configure the JWT processor with a key selector to feed matching public
-    // RSA keys sourced from the JWK set URL
-    JWSKeySelector keySelector = new JWSVerificationKeySelector(expectedJWSAlg, keySource);
-    jwtProcessor.setJWSKeySelector(keySelector);
+    // RSA keys sourced from the JWK set URL, or as in this example with the shared secret.
+    //JWSKeySelector keySelector = new JWSVerificationKeySelector(expectedJWSAlg, keySource);
+    JWSKeySelector jwsKeySelector = new JWSVerificationKeySelector(expectedJWSAlg, secret);
+    jwtProcessor.setJWSKeySelector(jwsKeySelector);
 
     // The expected JWE algorithm and method
     JWEAlgorithm expectedJWEAlg = JWEAlgorithm.RSA1_5;
@@ -99,9 +104,9 @@ public class ReferenceTokenSample {
 
     // The JWE key source
     String decodedKey = new String(Base64.getDecoder().decode(b64EncodedCert));
-    JWK secretKey = JWK.parse(decodedKey);
+    JWK secretJWKKey = JWK.parse(decodedKey);
 
-    JWKSet set = new JWKSet(secretKey);
+    JWKSet set = new JWKSet(secretJWKKey);
     JWKSource jweKeySource = new ImmutableJWKSet(set);
 
     // Configure a key selector to handle the decryption phase
@@ -120,16 +125,19 @@ public class ReferenceTokenSample {
   public static void main(String[] args){
 
     // A client will connect to your endpoint with following header -> Authorization: Bearer <referencetoken>
-    // This referencetoken is then used to do HTTP GET towards Smart Ansatt IDP url (without the Bearer prefix), where you will recieve an encrypted
-    // jwt containing userinfo.
+    // This referencetoken is then used to do HTTP GET towards Smart Ansatt IDP url (without the Bearer prefix).
     // Production endpoint: https://idp.smartansatt.telenor.no    Development endpoint: https://smartworker-dev-azure-idp.pimdemo.no
+    //
+    // From the 'getUserInfo' method you will receive a Base64 encoded string of the JWT which you will need to decrypt and verify the signature
+    // receivedJWTfromUserInfoEndpoint = "someRandomBase64Encodedstring.someRandomBase64Encodedstring.someRandomBase64Encodedstring.someRandomBase64Encodedstring.someRandomBase64Encodedstring"
 
     try {
 
       final String idpUrl = "https://idp.smartansatt.telenor.no";
       final String b64EncodedCert = "";
       final String referenceToken = "";
-      String payload = ReferenceTokenSample.getUserInfo(idpUrl, referenceToken, b64EncodedCert);
+      final String clientSecret = "";
+      String payload = ReferenceTokenSample.getUserInfo(idpUrl, referenceToken, b64EncodedCert, clientSecret);
 
       System.out.println(payload.toString());
       /* The payload will typically look something like this
